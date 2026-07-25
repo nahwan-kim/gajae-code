@@ -160,6 +160,8 @@ interface PreparedNewSessionState extends PreparedNewSession {
 	flushed: boolean;
 	committed: boolean;
 	discarded: boolean;
+	persistenceWriter?: NdjsonFileWriter;
+	persistenceTempPath?: string;
 }
 
 export interface SessionEntryBase {
@@ -4005,7 +4007,7 @@ export class SessionManager {
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
-	#preparedNewSessions = new WeakSet<PreparedNewSessionState>();
+	#preparedNewSessions = new Set<PreparedNewSessionState>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -4031,6 +4033,8 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	/** Failed staged persistence retains its exact writer and temporary pathname for retryable cleanup. */
+	#preparedNewSessionCleanupInProgress = false;
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
@@ -4381,6 +4385,7 @@ export class SessionManager {
 	 * @internal
 	 */
 	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
+		await this.#retryPreparedNewSessionCleanups();
 		await this.#closePersistWriter();
 		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
 		const sessionId = preallocated ?? createSessionId();
@@ -4491,22 +4496,28 @@ export class SessionManager {
 			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 			await this.#managedTranscriptStore(stage.sessionFile).replace(path.basename(stage.sessionFile), bytes);
 		} else {
+			const staleCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
+			if (staleCleanupError) throw staleCleanupError;
 			const dir = path.resolve(stage.sessionFile, "..");
 			const tempPath = path.join(dir, `.${path.basename(stage.sessionFile)}.${Snowflake.next()}.tmp`);
 			const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+			stage.persistenceTempPath = tempPath;
+			stage.persistenceWriter = writer;
 			try {
 				for (const entry of entries) await writer.write(entry);
 				await writer.flush();
 				await writer.fsync();
 				await writer.close();
+				stage.persistenceWriter = undefined;
 				await this.#replaceSessionFile(tempPath, stage.sessionFile);
+				stage.persistenceTempPath = undefined;
 			} catch (error) {
-				try {
-					await writer.close();
-				} catch {}
-				try {
-					await this.storage.unlink(tempPath);
-				} catch {}
+				const cleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
+				if (cleanupError)
+					throw new AggregateError(
+						[toError(error), cleanupError],
+						"Prepared session persistence and temporary-file cleanup both failed.",
+					);
 				throw toError(error);
 			}
 		}
@@ -4549,6 +4560,7 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
 		const sourceFile = this.#sessionFile;
@@ -4585,6 +4597,7 @@ export class SessionManager {
 			committed: false,
 			discarded: false,
 		};
+		this.#preparedNewSessions.add(stage);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
 			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
@@ -4597,15 +4610,22 @@ export class SessionManager {
 				this.storage.writeTextSync(sessionFile, content);
 			}
 		} catch (error) {
-			await this.discardUncommittedSession(sessionFile);
-			throw error;
+			try {
+				await this.discardPreparedNewSession(stage);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[toError(error), toError(cleanupError)],
+					"Fork preparation and staged session cleanup both failed.",
+				);
+			}
+			throw toError(error);
 		}
-		this.#preparedNewSessions.add(stage);
 		return stage;
 	}
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+		await this.#retryPreparedNewSessionCleanups();
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
@@ -4731,9 +4751,71 @@ export class SessionManager {
 	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) return;
-		if (stage.sessionFile) await this.discardUncommittedSession(stage.sessionFile);
+		const persistenceCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
+		let sessionCleanupError: Error | undefined;
+		if (stage.sessionFile) {
+			try {
+				await this.discardUncommittedSession(stage.sessionFile);
+			} catch (error) {
+				sessionCleanupError = toError(error);
+			}
+		}
+		if (persistenceCleanupError || sessionCleanupError) {
+			const errors = [persistenceCleanupError, sessionCleanupError].filter(
+				(error): error is Error => error !== undefined,
+			);
+			throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Prepared session cleanup failed.");
+		}
 		this.#preparedNewSessions.delete(stage);
 		stage.discarded = true;
+	}
+
+	async #retryPreparedNewSessionCleanups(): Promise<void> {
+		if (this.#preparedNewSessionCleanupInProgress) return;
+		this.#preparedNewSessionCleanupInProgress = true;
+		try {
+			const errors: Error[] = [];
+			for (const stage of [...this.#preparedNewSessions]) {
+				if (stage.committed || stage.discarded) continue;
+				try {
+					await this.discardPreparedNewSession(stage);
+				} catch (error) {
+					errors.push(toError(error));
+				}
+			}
+			if (errors.length > 0)
+				throw errors.length === 1
+					? errors[0]
+					: new AggregateError(errors, "Prepared session cleanup retry failed.");
+		} finally {
+			this.#preparedNewSessionCleanupInProgress = false;
+		}
+	}
+
+	async #cleanupPreparedNewSessionPersistence(stage: PreparedNewSessionState): Promise<Error | undefined> {
+		const errors: Error[] = [];
+		if (stage.persistenceWriter) {
+			try {
+				await stage.persistenceWriter.close();
+				stage.persistenceWriter = undefined;
+			} catch (error) {
+				errors.push(toError(error));
+			}
+		}
+		if (stage.persistenceTempPath && !stage.persistenceWriter) {
+			try {
+				await this.storage.unlink(stage.persistenceTempPath);
+				stage.persistenceTempPath = undefined;
+			} catch (error) {
+				if (!isEnoent(error)) errors.push(toError(error));
+				else stage.persistenceTempPath = undefined;
+			}
+		}
+		return errors.length === 0
+			? undefined
+			: errors.length === 1
+				? errors[0]
+				: new AggregateError(errors, "Prepared session temporary-file cleanup failed.");
 	}
 
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */

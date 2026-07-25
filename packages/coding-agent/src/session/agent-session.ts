@@ -9055,15 +9055,17 @@ export class AgentSession {
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				// The successor is ready but still unpublished. Finish all fallible
+				// predecessor interruption before the synchronous identity commit.
+				this.#disconnectFromAgent();
+				await this.abort();
+				if (this.isCompacting) {
+					this.abortCompaction();
+					while (this.isCompacting) await Bun.sleep(10);
+				}
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
-			}
-			this.#disconnectFromAgent();
-			await this.abort();
-			if (this.isCompacting) {
-				this.abortCompaction();
-				while (this.isCompacting) await Bun.sleep(10);
 			}
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");

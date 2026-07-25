@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, Message, ProviderPayload, TextContent } from "@gajae-code/ai";
 import { MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { type PreparedNewSession, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	MemorySessionStorage,
 	type SessionStorage,
@@ -228,6 +228,49 @@ class FailingPreparedCleanupStorage extends MemorySessionStorage {
 	}
 }
 
+class RetryablePreparedPersistenceStorage extends MemorySessionStorage {
+	failClose = true;
+	failTempUnlink = true;
+	closeAttempts = 0;
+	tempUnlinkAttempts = 0;
+	closeState: ReturnType<SessionStorageWriter["getCloseState"]> = "open";
+
+	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
+		const writer = super.openWriter(path, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: async () => {
+				this.closeAttempts++;
+				if (this.failClose) {
+					this.failClose = false;
+					this.closeState = "close_failed_retryable";
+					throw new Error("prepared writer close failed");
+				}
+				await writer.close();
+				this.closeState = writer.getCloseState();
+			},
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => this.closeState,
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+
+	async unlink(target: string): Promise<void> {
+		if (target.includes(".tmp")) {
+			this.tempUnlinkAttempts++;
+			if (this.failTempUnlink) {
+				this.failTempUnlink = false;
+				throw new Error("prepared temp unlink failed");
+			}
+		}
+		return super.unlink(target);
+	}
+}
+
 class FailingBranchPersistenceStorage extends MemorySessionStorage {
 	failBranchWrite = false;
 	failDelete = false;
@@ -267,16 +310,43 @@ describe("SessionManager resident retention boundaries", () => {
 		expect(session.getSessionFile()).toBe(prepared.sessionFile);
 	});
 
-	it("retains staged cleanup authority after a deletion failure", async () => {
+	it("strongly retains failed staged cleanup after the caller drops its handle", async () => {
 		const storage = new FailingPreparedCleanupStorage();
-		const session = SessionManager.create("/cwd", "/sessions", storage);
-		const prepared = await session.prepareNewSession();
-		await session.ensurePreparedNewSessionOnDisk(prepared);
+		const session = SessionManager.create("/cwd", path.resolve("/sessions"), storage);
+		let prepared: PreparedNewSession | undefined = await session.prepareNewSession();
+		const stagedPath = prepared.sessionFile!;
+		await session.ensurePreparedNewSessionOnDisk(prepared!);
 		storage.failDelete = true;
 
-		await expect(session.discardPreparedNewSession(prepared)).rejects.toThrow("staged cleanup failed");
+		await expect(session.discardPreparedNewSession(prepared!)).rejects.toThrow("staged cleanup failed");
+		prepared = undefined;
 		storage.failDelete = false;
-		await expect(session.discardPreparedNewSession(prepared)).resolves.toBeUndefined();
+		await session.prepareNewSession();
+
+		expect(storage.existsSync(stagedPath)).toBe(false);
+	});
+
+	it("preserves prepared writer-close and temp-unlink failures and retries both cleanups", async () => {
+		const storage = new RetryablePreparedPersistenceStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const prepared = await session.prepareNewSession();
+
+		try {
+			await session.ensurePreparedNewSessionOnDisk(prepared);
+			expect.unreachable("Expected prepared persistence to fail");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors.map(item => String(item))).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("prepared writer close failed"),
+					expect.stringContaining("prepared temp unlink failed"),
+				]),
+			);
+		}
+
+		await expect(session.ensurePreparedNewSessionOnDisk(prepared)).resolves.toBeUndefined();
+		expect(storage.closeAttempts).toBeGreaterThanOrEqual(3);
+		expect(storage.tempUnlinkAttempts).toBeGreaterThanOrEqual(2);
 	});
 
 	it("cleans up a partially persisted branch when branch preparation fails", async () => {
@@ -311,6 +381,32 @@ describe("SessionManager resident retention boundaries", () => {
 				]),
 			);
 		}
+	});
+
+	it("preserves fork publication and cleanup errors while retaining retry authority", async () => {
+		const storage = new FailingBranchPersistenceStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		session.appendMessage({ role: "user", content: "fork source", timestamp: 1 });
+		session.appendMessage(assistantMessage());
+		storage.failBranchWrite = true;
+		storage.failDelete = true;
+
+		try {
+			await session.prepareFork();
+			expect.unreachable("Expected fork preparation to fail");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors.map(item => String(item))).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("branch persistence failed"),
+					expect.stringContaining("branch cleanup failed"),
+				]),
+			);
+		}
+
+		storage.failBranchWrite = false;
+		storage.failDelete = false;
+		await expect(session.prepareNewSession()).resolves.toBeDefined();
 	});
 
 	it("keeps resident entries bounded after fresh large appends while readers materialize full content and JSONL stays capped text", async () => {
