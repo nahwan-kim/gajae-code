@@ -134,6 +134,24 @@ export interface NewSessionOptions {
 	drop?: boolean;
 }
 
+/** Internal successor prepared without changing the manager's visible identity. */
+export interface PreparedNewSession {
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+	readonly artifactsDir: string | null;
+	readonly managedLegacyLocalMigrationSource: ManagedLegacyLocalMigrationSource | null;
+}
+
+interface PreparedNewSessionState extends PreparedNewSession {
+	readonly header: SessionHeader;
+	readonly fileEntries: FileEntry[];
+	readonly sessionName: string | undefined;
+	readonly titleSource: "auto" | "user" | undefined;
+	flushed: boolean;
+	committed: boolean;
+	discarded: boolean;
+}
+
 export interface SessionEntryBase {
 	type: string;
 	id: string;
@@ -3977,6 +3995,7 @@ export class SessionManager {
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
+	#preparedNewSessions = new WeakSet<PreparedNewSessionState>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -4313,10 +4332,349 @@ export class SessionManager {
 
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		const prepared = await this.prepareNewSession(options);
+		this.commitPreparedNewSession(prepared);
+		return prepared.sessionFile;
+	}
+
+	/**
+	 * Allocate a fresh successor without publishing it through the manager's public
+	 * getters. The returned authority is deliberately immutable so readiness work
+	 * can resolve local:// against the successor while the predecessor stays live.
+	 * @internal
+	 */
+	async prepareNewSession(options?: NewSessionOptions): Promise<PreparedNewSession> {
 		await this.#closePersistWriter();
-		const sessionFile = this.#newSessionSync(options);
+		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+		const sessionId = preallocated ?? createSessionId();
+		const timestamp = new Date().toISOString();
+		const sessionFile = this.persist
+			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
+			: undefined;
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionId,
+			timestamp,
+			cwd: this.cwd,
+			parentSession: options?.parentSession,
+		};
+		const stage: PreparedNewSessionState = {
+			sessionId,
+			sessionFile,
+			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
+			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
+			header,
+			fileEntries: [header],
+			sessionName: undefined,
+			titleSource: undefined,
+			flushed: false,
+			committed: false,
+			discarded: false,
+		};
+		this.#preparedNewSessions.add(stage);
+		return stage;
+	}
+
+	/** Append a model selection to an unpublished successor. @internal */
+	appendPreparedModelChange(prepared: PreparedNewSession, model: string): string {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		const entry: ModelChangeEntry = {
+			type: "model_change",
+			id: this.#nextPreparedNewSessionEntryId(stage),
+			parentId: this.#preparedNewSessionLeafId(stage),
+			timestamp: new Date().toISOString(),
+			model,
+		};
+		stage.fileEntries.push(entry);
+		return entry.id;
+	}
+
+	/** Append a thinking-level selection to an unpublished successor. @internal */
+	appendPreparedThinkingLevelChange(prepared: PreparedNewSession, thinkingLevel?: string): string {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		const entry: ThinkingLevelChangeEntry = {
+			type: "thinking_level_change",
+			id: this.#nextPreparedNewSessionEntryId(stage),
+			parentId: this.#preparedNewSessionLeafId(stage),
+			timestamp: new Date().toISOString(),
+			thinkingLevel: thinkingLevel ?? null,
+		};
+		stage.fileEntries.push(entry);
+		return entry.id;
+	}
+
+	/** Append a service-tier selection to an unpublished successor. @internal */
+	appendPreparedServiceTierChange(prepared: PreparedNewSession, serviceTier: ServiceTier | null): string {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		const entry: ServiceTierChangeEntry = {
+			type: "service_tier_change",
+			id: this.#nextPreparedNewSessionEntryId(stage),
+			parentId: this.#preparedNewSessionLeafId(stage),
+			timestamp: new Date().toISOString(),
+			serviceTier,
+		};
+		stage.fileEntries.push(entry);
+		return entry.id;
+	}
+
+	/** Append a displayable custom message to an unpublished successor. @internal */
+	appendPreparedCustomMessageEntry<T = unknown>(
+		prepared: PreparedNewSession,
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+		attribution: MessageAttribution = "agent",
+	): string {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		const entry: CustomMessageEntry<T> = {
+			type: "custom_message",
+			customType,
+			content,
+			display,
+			details: stripInternalDetailsFields(details),
+			attribution,
+			id: this.#nextPreparedNewSessionEntryId(stage),
+			parentId: this.#preparedNewSessionLeafId(stage),
+			timestamp: new Date().toISOString(),
+		};
+		stage.fileEntries.push(entry);
+		return entry.id;
+	}
+
+	/** Persist an unpublished successor without adopting it. @internal */
+	async ensurePreparedNewSessionOnDisk(prepared: PreparedNewSession): Promise<void> {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		if (!this.persist || !stage.sessionFile || stage.flushed) return;
+		const entries = await Promise.all(
+			stage.fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
+		);
+		if (this.destination.kind === "managed") {
+			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+			await this.#managedTranscriptStore(stage.sessionFile).replace(path.basename(stage.sessionFile), bytes);
+		} else {
+			const dir = path.resolve(stage.sessionFile, "..");
+			const tempPath = path.join(dir, `.${path.basename(stage.sessionFile)}.${Snowflake.next()}.tmp`);
+			const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+			try {
+				for (const entry of entries) await writer.write(entry);
+				await writer.flush();
+				await writer.fsync();
+				await writer.close();
+				await this.#replaceSessionFile(tempPath, stage.sessionFile);
+			} catch (error) {
+				try {
+					await writer.close();
+				} catch {}
+				try {
+					await this.storage.unlink(tempPath);
+				} catch {}
+				throw toError(error);
+			}
+		}
+		stage.flushed = true;
+	}
+
+	/** Build context from an unpublished successor without reading active manager state. @internal */
+	buildPreparedNewSessionContext(prepared: PreparedNewSession): SessionContext {
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		return buildSessionContext(
+			stage.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
+			undefined,
+			undefined,
+			stage.sessionId,
+		);
+	}
+
+	#getPreparedNewSessionStage(prepared: PreparedNewSession): PreparedNewSessionState {
+		const stage = prepared as PreparedNewSessionState;
+		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded)
+			throw new Error("Prepared session is no longer available.");
+		return stage;
+	}
+
+	#preparedNewSessionLeafId(stage: PreparedNewSessionState): string | null {
+		for (let index = stage.fileEntries.length - 1; index >= 0; index--) {
+			const entry = stage.fileEntries[index];
+			if (entry.type !== "session") return entry.id;
+		}
+		return null;
+	}
+
+	#nextPreparedNewSessionEntryId(stage: PreparedNewSessionState): string {
+		const ids = new Map<string, SessionEntry>();
+		for (const entry of stage.fileEntries) {
+			if (entry.type !== "session") ids.set(entry.id, entry);
+		}
+		return generateId(ids);
+	}
+
+	/** Prepare a forked successor without publishing it through public manager state. @internal */
+	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		if (!this.persist || !this.#sessionFile) return undefined;
+		await this.#closePersistWriter();
+		const sourceFile = this.#sessionFile;
+		const sourceId = this.#sessionId;
+		const timestamp = new Date().toISOString();
+		const sessionId = createSessionId();
+		const sessionFile = path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionId,
+			title: this.#sessionName,
+			titleSource: this.#titleSource,
+			timestamp,
+			cwd: this.cwd,
+			parentSession: sourceId,
+		};
+		const entries: FileEntry[] = [
+			header,
+			...materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
+				(entry): entry is SessionEntry => entry.type !== "session",
+			),
+		];
+		const stage: PreparedNewSessionState = {
+			sessionId,
+			sessionFile,
+			artifactsDir: sessionFile.slice(0, -6),
+			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
+			header,
+			fileEntries: entries,
+			sessionName: this.#sessionName,
+			titleSource: this.#titleSource,
+			flushed: true,
+			committed: false,
+			discarded: false,
+		};
+		try {
+			await this.copyArtifactsForFork(sourceFile, sessionFile);
+			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
+			if (this.destination.kind === "managed") {
+				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+					path.basename(sessionFile),
+					Buffer.from(content, "utf8"),
+				);
+			} else {
+				this.storage.writeTextSync(sessionFile, content);
+			}
+		} catch (error) {
+			await this.discardUncommittedSession(sessionFile);
+			throw error;
+		}
+		this.#preparedNewSessions.add(stage);
+		return stage;
+	}
+
+	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
+	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+		const branchPath = this.#getCanonicalBranchClones(leafId);
+		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
+		await this.#closePersistWriter();
+		const timestamp = new Date().toISOString();
+		const sessionId = createSessionId();
+		const sessionFile = this.persist
+			? path.join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${sessionId}.jsonl`)
+			: undefined;
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionId,
+			timestamp,
+			cwd: this.cwd,
+			parentSession: this.persist ? this.#sessionFile : undefined,
+		};
+		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
+		const pathEntryIds = new Set(pathWithoutLabels.map(entry => entry.id));
+		const labelEntries: LabelEntry[] = [];
+		let labelParentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id ?? null;
+		for (const [targetId, label] of this.#labelsById) {
+			if (!pathEntryIds.has(targetId)) continue;
+			const labelEntry: LabelEntry = {
+				type: "label",
+				id: generateId({ has: id => pathEntryIds.has(id) }),
+				parentId: labelParentId,
+				timestamp: new Date().toISOString(),
+				targetId,
+				label,
+			};
+			pathEntryIds.add(labelEntry.id);
+			labelEntries.push(labelEntry);
+			labelParentId = labelEntry.id;
+		}
+		const entries: FileEntry[] = [
+			header,
+			...materializeResidentEntriesForReadSync(pathWithoutLabels, this.#residentBlobStores()),
+			...labelEntries,
+		];
+		const stage: PreparedNewSessionState = {
+			sessionId,
+			sessionFile,
+			artifactsDir: sessionFile ? sessionFile.slice(0, -6) : null,
+			managedLegacyLocalMigrationSource: this.#managedLegacyLocalMigrationSourceFor(sessionFile),
+			header,
+			fileEntries: entries,
+			sessionName: undefined,
+			titleSource: undefined,
+			flushed: this.persist,
+			committed: false,
+			discarded: false,
+		};
+		if (sessionFile) {
+			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
+			if (this.destination.kind === "managed") {
+				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+					path.basename(sessionFile),
+					Buffer.from(content, "utf8"),
+				);
+			} else {
+				this.storage.writeTextSync(sessionFile, content);
+			}
+		}
+		this.#preparedNewSessions.add(stage);
+		return stage;
+	}
+
+	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
+	commitPreparedNewSession(prepared: PreparedNewSession): void {
+		const stage = prepared as PreparedNewSessionState;
+		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
+			throw new Error("Prepared session is no longer available.");
+		}
+		stage.committed = true;
+		this.#preparedNewSessions.delete(stage);
+		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
+			this.#lifecycleIdAdopted = true;
+		this.#persistChain = Promise.resolve();
+		this.#persistError = undefined;
+		this.#persistErrorReported = false;
+		this.#sessionId = stage.sessionId;
+		this.#sessionName = stage.sessionName;
+		this.#titleSource = stage.titleSource;
+		this.#sessionFile = stage.sessionFile;
+		this.#fileEntries = [...stage.fileEntries];
+		this.#flushed = stage.flushed;
+		this.#needsFullRewriteOnNextPersist = false;
+		this.#ensuredOnDisk = stage.flushed;
+		this.#inMemoryArtifacts = null;
+		this.#inMemoryArtifactCounter = 0;
+		this.#artifactManager = null;
+		this.#artifactManagerSessionFile = null;
+		this.#adoptedArtifactManager = null;
+		this.#resetResidentTextBlobStore();
+		this.#reexternalizeFileEntriesForResidentStore();
+		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		this.#bumpAllRevisions();
-		return sessionFile;
+	}
+
+	/** Exact-discard only an uncommitted successor prepared by this manager. @internal */
+	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
+		const stage = prepared as PreparedNewSessionState;
+		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) return;
+		this.#preparedNewSessions.delete(stage);
+		stage.discarded = true;
+		if (stage.sessionFile) await this.discardUncommittedSession(stage.sessionFile);
 	}
 
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
@@ -5670,9 +6028,13 @@ export class SessionManager {
 
 	/** Supplies opaque retained authority for mandatory managed legacy local migration. */
 	getManagedLegacyLocalMigrationSource(): ManagedLegacyLocalMigrationSource | null {
-		if (this.destination.kind !== "managed" || !this.#sessionFile || this.#adoptedArtifactManager) return null;
-		const store = this.#managedTranscriptStore();
-		const legacyArtifactsRoot = path.basename(this.#sessionFile.slice(0, -6));
+		return this.#managedLegacyLocalMigrationSourceFor(this.#sessionFile);
+	}
+
+	#managedLegacyLocalMigrationSourceFor(sessionFile: string | undefined): ManagedLegacyLocalMigrationSource | null {
+		if (this.destination.kind !== "managed" || !sessionFile || this.#adoptedArtifactManager) return null;
+		const store = this.#managedTranscriptStore(sessionFile);
+		const legacyArtifactsRoot = path.basename(sessionFile.slice(0, -6));
 		const legacyLocalRoot = path.posix.join(legacyArtifactsRoot, "local");
 		return {
 			capture: async () => {

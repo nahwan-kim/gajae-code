@@ -269,6 +269,30 @@ describe("createAgentSession session storage isolation", () => {
 				"utf8",
 			);
 			expect(marker === "verified\n" || marker === "absent\n" || marker === "cleanup_pending\n").toBe(true);
+
+			// Every successor must be ready before its identity becomes usable: exercise
+			// both a repeated /new rotation and a subsequent fork with immediate resolution.
+			expect(await session.newSession()).toBe(true);
+			const secondNewOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			expect(resolveLocalUrlToPath("local://second-new.md", secondNewOptions)).toBe(
+				path.join(resolveLocalRoot(secondNewOptions), "second-new.md"),
+			);
+
+			expect(await session.fork()).toBe(true);
+			const forkOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			expect(resolveLocalUrlToPath("local://fork.md", forkOptions)).toBe(
+				path.join(resolveLocalRoot(forkOptions), "fork.md"),
+			);
 		} finally {
 			await session.dispose();
 		}

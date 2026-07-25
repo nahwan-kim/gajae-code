@@ -379,6 +379,7 @@ import type {
 	CompactionEntry,
 	DefaultModelSelectionStage,
 	NewSessionOptions,
+	PreparedNewSession,
 	RecoveryHydrationContext,
 	RecoveryHydrationPromotionFence,
 	SessionContext,
@@ -4612,13 +4613,13 @@ export class AgentSession {
 		return resolveToCwd(normalized, this.sessionManager.getCwd());
 	}
 
-	#localProtocolOptions(): LocalProtocolOptions {
+	#localProtocolOptions(prepared?: PreparedNewSession): LocalProtocolOptions {
 		return {
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+			getArtifactsDir: () => prepared?.artifactsDir ?? this.sessionManager.getArtifactsDir(),
 			isManagedDestination: () => this.sessionManager.isManagedDestination(),
-			// Required for verified legacy local:// migration on managed sessions (#2797 / #2925).
-			getManagedLegacyLocalMigrationSource: () => this.sessionManager.getManagedLegacyLocalMigrationSource(),
-			getSessionId: () => this.sessionManager.getSessionId(),
+			getManagedLegacyLocalMigrationSource: () =>
+				prepared?.managedLegacyLocalMigrationSource ?? this.sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => prepared?.sessionId ?? this.sessionManager.getSessionId(),
 		};
 	}
 
@@ -6479,6 +6480,15 @@ export class AgentSession {
 		return { ...context, messages: this.#withoutEphemeralCustomMessages(context.messages) };
 	}
 
+	/** Build display context from an unpublished successor without changing active session state. @internal */
+	buildPreparedDisplaySessionContext(prepared: PreparedNewSession): SessionContext {
+		const context = deobfuscateSessionContext(
+			this.sessionManager.buildPreparedNewSessionContext(prepared),
+			this.#obfuscator,
+		);
+		return { ...context, messages: this.#withoutEphemeralCustomMessages(context.messages) };
+	}
+
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
 	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {
 		const transformedMessages = await this.#transformContext(messages, signal);
@@ -6746,8 +6756,7 @@ export class AgentSession {
 		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
-	#constructWorkflowGateEmitter(): WorkflowGateEmitter {
-		const sessionId = this.sessionManager.getSessionId();
+	#constructWorkflowGateEmitter(sessionId = this.sessionManager.getSessionId()): WorkflowGateEmitter {
 		assertNonEmptyGjcSessionId(sessionId, "AgentSession workflow-gate session");
 		const gateStore = this.sessionManager.isPersisted()
 			? new FileGateStore(path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"))
@@ -9026,24 +9035,26 @@ export class AgentSession {
 		}
 
 		if (!lease) {
+			if (!options?.drop) await this.sessionManager.flush();
+			const prepared = await this.sessionManager.prepareNewSession(options);
+			try {
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.sessionManager.commitPreparedNewSession(prepared);
+			} catch (error) {
+				await this.sessionManager.discardPreparedNewSession(prepared);
+				throw error;
+			}
 			this.#disconnectFromAgent();
 			await this.abort();
 			if (this.isCompacting) {
 				this.abortCompaction();
-				while (this.isCompacting) {
-					await Bun.sleep(10);
-				}
+				while (this.isCompacting) await Bun.sleep(10);
 			}
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
-			if (!options?.drop) await this.sessionManager.flush();
-			await this.sessionManager.newSession(options);
-			// Gate the successor local:// root before the successor identity is
-			// published to the agent, the workflow-gate emitter, hooks, or any
-			// synchronous resolver (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
+
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -9106,15 +9117,19 @@ export class AgentSession {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
 
+			const prepared = await this.sessionManager.prepareNewSession(options);
+			try {
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.sessionManager.commitPreparedNewSession(prepared);
+			} catch (error) {
+				await this.sessionManager.discardPreparedNewSession(prepared);
+				throw error;
+			}
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
-			await this.sessionManager.newSession(options);
-			// Gate the successor local:// root before the successor identity is
-			// published to the agent, the workflow-gate emitter, hooks, or any
-			// synchronous resolver (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
+
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -9252,16 +9267,19 @@ export class AgentSession {
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
 
-			// Fork the session (creates new session file with same entries)
-			const forkResult = await this.sessionManager.fork();
-			if (!forkResult) {
+			// Prepare the copied successor and complete local:// readiness while all
+			// public manager getters remain bound to the predecessor.
+			const prepared = await this.sessionManager.prepareFork();
+			if (!prepared) {
 				return false;
 			}
-
-			// Fork rotates the session identity (and copies artifacts); gate the
-			// successor local:// root before that identity is published (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
-			// Update agent session ID
+			try {
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.sessionManager.commitPreparedNewSession(prepared);
+			} catch (error) {
+				await this.sessionManager.discardPreparedNewSession(prepared);
+				throw error;
+			}
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -10652,26 +10670,35 @@ export class AgentSession {
 			// user work that agent.reset() would otherwise clear.
 			const rollbackAgentSteeringQueue = this.agent.snapshotSteering();
 			const rollbackAgentFollowUpQueue = this.agent.snapshotFollowUp();
-			let successorSessionFile: string | undefined;
 			let savedPath: string | undefined;
 			let committed = false;
-			// Suspend (do not destroy) the workflow-gate emitter so it can be fenced on
-			// commit or resumed on rollback. Suspension runs inside the transaction so a
-			// listener fault during suspension is rolled back like any other prepare step.
-			let suspendedWorkflowGateEmitter: WorkflowGateEmitter | undefined;
+			let prepared: PreparedNewSession | undefined;
 			try {
-				suspendedWorkflowGateEmitter = this.#suspendWorkflowGateEmitter(rollbackSessionState.sessionId);
-				// --- Prepare (reversible): build and persist the successor session
-				// without touching predecessor authority. No irreversible predecessor
-				// teardown or identity publication happens until the commit boundary.
-				await this.sessionManager.newSession(
+				// Prepare local:// migration, successor entries, persistence, display state,
+				// and gate construction without publishing successor manager/session state.
+				prepared = await this.sessionManager.prepareNewSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
-				successorSessionFile = this.sessionFile;
-				// Gate the successor local:// root inside the reversible prepare
-				// window, before the successor identity is published; a gate failure
-				// here rolls back (#2797 / #2925).
-				await initializeLocalRoot(this.#localProtocolOptions());
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				if (model) this.sessionManager.appendPreparedModelChange(prepared, `${model.provider}/${model.id}`);
+				this.sessionManager.appendPreparedThinkingLevelChange(prepared, this.thinkingLevel);
+				this.sessionManager.appendPreparedServiceTierChange(prepared, this.serviceTier ?? null);
+				this.sessionManager.appendPreparedCustomMessageEntry(
+					prepared,
+					"handoff",
+					createHandoffContext(handoffText),
+					true,
+					undefined,
+					"agent",
+				);
+				await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
+				const sessionContext = this.buildPreparedDisplaySessionContext(prepared);
+				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
+
+				// --- Commit boundary: every fallible successor preparation step above used
+				// staged state. This synchronous adoption is the sole identity publication.
+				this.sessionManager.commitPreparedNewSession(prepared);
+				committed = true;
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -10680,16 +10707,8 @@ export class AgentSession {
 				this.#pendingNextTurnMessages = [];
 				this.#scheduledHiddenNextTurnGeneration = undefined;
 				this.#todoReminderCount = 0;
-				if (model) {
-					this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
-				}
-				this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-				this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
-
-				// Inject the handoff document as a custom message
-				const handoffContent = createHandoffContext(handoffText);
-				this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
-				await this.sessionManager.ensureOnDisk();
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#syncTodoPhasesFromBranch();
 				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 					try {
 						const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
@@ -10701,30 +10720,9 @@ export class AgentSession {
 					}
 				}
 
-				// Rebuild agent messages from session
-				const sessionContext = this.buildDisplaySessionContext();
-				this.agent.replaceMessages(sessionContext.messages);
-				this.#syncTodoPhasesFromBranch();
-
-				// Construct the successor workflow-gate emitter in the reversible window:
-				// FileGateStore load / broker init can throw, and a failure here must roll
-				// back rather than corrupt an already-committed switch. Publication is
-				// deferred to the (no-throw) commit step below.
-				const successorGateEmitter = this.#constructWorkflowGateEmitter();
-
-				// --- Commit boundary: the successor is durably persisted and every
-				// reversible, fallible step above has succeeded. Cross the irreversible
-				// commit BEFORE any identity rotation. Fencing the predecessor gate
-				// emitter and rotating provider sessions cannot be undone, so once we
-				// begin them a failure must RETAIN the committed successor rather than
-				// attempt a (now-impossible) rollback that would resume a fenced emitter.
-				committed = true;
+				// The forward-only suffix starts only after the committed successor is live.
 				this.#resetInjectedContextSignatures();
-				this.#publishWorkflowGateEmitter(
-					successorGateEmitter,
-					rollbackSessionState.sessionId,
-					suspendedWorkflowGateEmitter,
-				);
+				this.#publishWorkflowGateEmitter(successorGateEmitter, rollbackSessionState.sessionId);
 				this.#closeAllProviderSessions("session handoff");
 				this.#rebindProviderSessionState(new Map());
 				this.#resetHindsightConversationTrackingIfHindsight();
@@ -10773,7 +10771,6 @@ export class AgentSession {
 				// were never mutated before commit, so they survive intact.
 				this.sessionManager.restoreState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
-				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.agent.replaceMessages(rollbackAgentMessages);
 				this.agent.clearAllQueues();
@@ -10785,14 +10782,12 @@ export class AgentSession {
 				this.#scheduledHiddenNextTurnGeneration = rollbackScheduledHiddenNextTurnGeneration;
 				this.#todoReminderCount = rollbackTodoReminderCount;
 				this.#syncTodoPhasesFromBranch();
-				// Remove the orphaned successor transcript/artifacts written before the
-				// failure so a rolled-back handoff leaves nothing behind.
-				if (successorSessionFile && successorSessionFile !== previousSessionFile) {
+				// Exact-discard only the staged successor; predecessor state was never adopted.
+				if (prepared) {
 					try {
-						await this.sessionManager.discardUncommittedSession(successorSessionFile);
+						await this.sessionManager.discardPreparedNewSession(prepared);
 					} catch (cleanupError) {
-						logger.warn("Failed to remove orphaned handoff session after rollback", {
-							path: successorSessionFile,
+						logger.warn("Failed to remove staged handoff successor after rollback", {
 							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 						});
 					}
@@ -14799,22 +14794,22 @@ export class AgentSession {
 				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
 
-			// Clear pending messages (bound to old session state)
+			// Flush pending writes before preparing the successor.
+			await this.sessionManager.flush();
+			const prepared = selectedEntry.parentId
+				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
+				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
+			try {
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.sessionManager.commitPreparedNewSession(prepared);
+			} catch (error) {
+				await this.sessionManager.discardPreparedNewSession(prepared);
+				throw error;
+			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-
-			// Flush pending writes before branching
-			await this.sessionManager.flush();
 			this.#cancelOwnAsyncJobs();
 
-			if (!selectedEntry.parentId) {
-				await this.sessionManager.newSession({ parentSession: previousSessionFile });
-			} else {
-				this.sessionManager.createBranchedSession(selectedEntry.parentId);
-			}
-			// Branch/tree-jump establishes a new session identity; gate the successor
-			// local:// root before that identity is published (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
