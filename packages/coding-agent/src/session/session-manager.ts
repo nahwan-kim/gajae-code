@@ -142,11 +142,21 @@ export interface PreparedNewSession {
 	readonly managedLegacyLocalMigrationSource: ManagedLegacyLocalMigrationSource | null;
 }
 
+interface PreparedSessionIndex {
+	readonly byId: Map<string, SessionEntry>;
+	readonly labelsById: Map<string, string>;
+	readonly leafId: string | null;
+	readonly usageStatistics: UsageStatistics;
+}
+
 interface PreparedNewSessionState extends PreparedNewSession {
 	readonly header: SessionHeader;
 	readonly fileEntries: FileEntry[];
 	readonly sessionName: string | undefined;
 	readonly titleSource: "auto" | "user" | undefined;
+	residentFileEntries?: FileEntry[];
+	residentTextBlobStore?: BlobStore;
+	index?: PreparedSessionIndex;
 	flushed: boolean;
 	committed: boolean;
 	discarded: boolean;
@@ -4125,6 +4135,21 @@ export class SessionManager {
 		this.#buildIndex();
 	}
 
+	#preparePreparedNewSessionForCommit(stage: PreparedNewSessionState): void {
+		const residentTextBlobStore = new MemoryBlobStore();
+		const residentFileEntries = stage.fileEntries.map(entry =>
+			prepareEntryForResidentSync(entry, {
+				textStore: residentTextBlobStore,
+				imageStore: this.#residentImageBlobStore,
+				sessionId: stage.sessionId,
+				sessionFile: stage.sessionFile,
+			}),
+		);
+		stage.residentTextBlobStore = residentTextBlobStore;
+		stage.residentFileEntries = residentFileEntries;
+		stage.index = this.#buildIndexForEntries(residentFileEntries, stage.sessionFile);
+	}
+
 	#resetMaterializedCaches(): void {
 		this.#materializedEntriesRevision = -1;
 		this.#materializedEntriesCache = undefined;
@@ -4333,7 +4358,19 @@ export class SessionManager {
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		const prepared = await this.prepareNewSession(options);
-		this.commitPreparedNewSession(prepared);
+		try {
+			this.commitPreparedNewSession(prepared);
+		} catch (error) {
+			try {
+				await this.discardPreparedNewSession(prepared);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"New session adoption and staged session cleanup both failed.",
+				);
+			}
+			throw error;
+		}
 		return prepared.sessionFile;
 	}
 
@@ -4621,19 +4658,31 @@ export class SessionManager {
 			committed: false,
 			discarded: false,
 		};
-		if (sessionFile) {
-			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-			if (this.destination.kind === "managed") {
-				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
-					path.basename(sessionFile),
-					Buffer.from(content, "utf8"),
-				);
-			} else {
-				this.storage.writeTextSync(sessionFile, content);
-			}
-		}
 		this.#preparedNewSessions.add(stage);
-		return stage;
+		try {
+			if (sessionFile) {
+				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
+				if (this.destination.kind === "managed") {
+					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+						path.basename(sessionFile),
+						Buffer.from(content, "utf8"),
+					);
+				} else {
+					this.storage.writeTextSync(sessionFile, content);
+				}
+			}
+			return stage;
+		} catch (error) {
+			try {
+				await this.discardPreparedNewSession(stage);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"Branch preparation and staged session cleanup both failed.",
+				);
+			}
+			throw error;
+		}
 	}
 
 	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
@@ -4642,6 +4691,14 @@ export class SessionManager {
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
 			throw new Error("Prepared session is no longer available.");
 		}
+		this.#preparePreparedNewSessionForCommit(stage);
+		const residentFileEntries = stage.residentFileEntries;
+		const residentTextBlobStore = stage.residentTextBlobStore;
+		const index = stage.index;
+		if (!residentFileEntries || !residentTextBlobStore || !index)
+			throw new Error("Prepared session adoption is incomplete.");
+		if (stage.sessionFile) writeTerminalBreadcrumb(this.cwd, stage.sessionFile);
+
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
 		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
@@ -4653,7 +4710,12 @@ export class SessionManager {
 		this.#sessionName = stage.sessionName;
 		this.#titleSource = stage.titleSource;
 		this.#sessionFile = stage.sessionFile;
-		this.#fileEntries = [...stage.fileEntries];
+		this.#fileEntries = residentFileEntries;
+		this.#residentTextBlobStore = residentTextBlobStore;
+		this.#byId = index.byId;
+		this.#labelsById = index.labelsById;
+		this.#leafId = index.leafId;
+		this.#usageStatistics = index.usageStatistics;
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
@@ -4662,9 +4724,6 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
-		this.#resetResidentTextBlobStore();
-		this.#reexternalizeFileEntriesForResidentStore();
-		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		this.#bumpAllRevisions();
 	}
 
@@ -4672,9 +4731,9 @@ export class SessionManager {
 	async discardPreparedNewSession(prepared: PreparedNewSession): Promise<void> {
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) return;
+		if (stage.sessionFile) await this.discardUncommittedSession(stage.sessionFile);
 		this.#preparedNewSessions.delete(stage);
 		stage.discarded = true;
-		if (stage.sessionFile) await this.discardUncommittedSession(stage.sessionFile);
 	}
 
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
@@ -5320,41 +5379,73 @@ export class SessionManager {
 	}
 
 	#buildIndex(): void {
-		this.#byId.clear();
-		this.#labelsById.clear();
-		this.#leafId = null;
-		this.#usageStatistics = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 };
+		const index = this.#buildIndexForEntries(this.#fileEntries, this.#sessionFile);
+		this.#byId = index.byId;
+		this.#labelsById = index.labelsById;
+		this.#leafId = index.leafId;
+		this.#usageStatistics = index.usageStatistics;
+	}
+
+	#buildIndexForEntries(fileEntries: FileEntry[], sessionFile: string | undefined): PreparedSessionIndex {
+		const byId = new Map<string, SessionEntry>();
+		const labelsById = new Map<string, string>();
+		let leafId: string | null = null;
+		const usageStatistics: UsageStatistics = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			premiumRequests: 0,
+			cost: 0,
+		};
+		const addUsage = (totals: ValidatedUsageTotals): boolean => {
+			const next = {
+				input: usageStatistics.input + totals.input,
+				output: usageStatistics.output + totals.output,
+				cacheRead: usageStatistics.cacheRead + totals.cacheRead,
+				cacheWrite: usageStatistics.cacheWrite + totals.cacheWrite,
+				premiumRequests: usageStatistics.premiumRequests + totals.premiumRequests,
+				cost: usageStatistics.cost + totals.cost,
+			};
+			if (Object.values(next).some(value => !Number.isFinite(value))) return false;
+			Object.assign(usageStatistics, next);
+			return true;
+		};
+		const accumulateUsage = (entry: SessionEntry): boolean => {
+			if (entry.type !== "message") return false;
+			const usage =
+				entry.message.role === "assistant"
+					? entry.message.usage
+					: entry.message.role === "toolResult" && entry.message.toolName === "task"
+						? getTaskToolUsage(entry.message.details)
+						: undefined;
+			if (usage === undefined) return false;
+			const totals = validatePersistedUsageTotals(usage);
+			return !(totals && addUsage(totals));
+		};
 		let malformedUsageRecords = 0;
 		const malformedUsageSample: string[] = [];
-		for (const entry of this.#fileEntries) {
+		for (const entry of fileEntries) {
 			if (entry.type === "session") continue;
-			this.#byId.set(entry.id, entry);
-			this.#leafId = entry.id;
+			byId.set(entry.id, entry);
+			leafId = entry.id;
 			if (entry.type === "label") {
-				if (entry.label) {
-					this.#labelsById.set(entry.targetId, entry.label);
-				} else {
-					this.#labelsById.delete(entry.targetId);
-				}
+				if (entry.label) labelsById.set(entry.targetId, entry.label);
+				else labelsById.delete(entry.targetId);
 			}
-			// Aggregate this entry's persisted usage through the shared validated,
-			// overflow-guarded path (see #accumulateEntryUsage). parseSessionEntries accepts
-			// any parseable JSON, so a torn/corrupt record can carry a still-valid-JSON but
-			// malformed `usage` (absent, {}, numeric strings, negatives, a non-record cost, or
-			// a cumulative overflow); such a record is skipped and reported below instead of
-			// poisoning every getUsageStatistics() consumer.
-			if (this.#accumulateEntryUsage(entry)) {
+			if (accumulateUsage(entry)) {
 				malformedUsageRecords++;
 				if (malformedUsageSample.length < MALFORMED_USAGE_SAMPLE_LIMIT) malformedUsageSample.push(entry.id);
 			}
 		}
 		if (malformedUsageRecords > 0) {
 			logger.warn("Skipped malformed or overflowing persisted usage records during resume aggregation", {
-				sessionFile: this.#sessionFile,
+				sessionFile,
 				count: malformedUsageRecords,
 				sampleEntryIds: malformedUsageSample,
 			});
 		}
+		return { byId, labelsById, leafId, usageStatistics };
 	}
 
 	/**

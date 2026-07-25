@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, Message, ProviderPayload, TextContent } from "@gajae-code/ai";
+import { MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	MemorySessionStorage,
@@ -218,7 +219,100 @@ class RenameEpermSyncStorage extends MemorySessionStorage {
 	}
 }
 
+class FailingPreparedCleanupStorage extends MemorySessionStorage {
+	failDelete = false;
+
+	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		if (this.failDelete) throw new Error("staged cleanup failed");
+		return super.deleteSessionWithArtifacts(sessionPath);
+	}
+}
+
+class FailingBranchPersistenceStorage extends MemorySessionStorage {
+	failBranchWrite = false;
+	failDelete = false;
+
+	writeTextSync(target: string, content: string): void {
+		if (this.failBranchWrite && target.endsWith(".jsonl")) {
+			super.writeTextSync(target, content);
+			throw new Error("branch persistence failed");
+		}
+		super.writeTextSync(target, content);
+	}
+
+	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		if (this.failDelete) throw new Error("branch cleanup failed");
+		return super.deleteSessionWithArtifacts(sessionPath);
+	}
+}
+
 describe("SessionManager resident retention boundaries", () => {
+	it("keeps the predecessor active and the stage discardable when resident externalization fails during adoption", async () => {
+		const storage = new MemorySessionStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		session.appendMessage({ role: "user", content: "predecessor", timestamp: 1 });
+		session.appendMessage(assistantMessage());
+		const predecessorFile = session.getSessionFile();
+		const prepared = await session.prepareNewSession();
+		session.appendPreparedCustomMessageEntry(prepared, "large", LARGE_TEXT, true);
+		const putSync = spyOn(MemoryBlobStore.prototype, "putSync").mockImplementation(() => {
+			throw new Error("resident externalization failed");
+		});
+
+		expect(() => session.commitPreparedNewSession(prepared)).toThrow("resident externalization failed");
+		expect(session.getSessionFile()).toBe(predecessorFile);
+		putSync.mockRestore();
+
+		expect(() => session.commitPreparedNewSession(prepared)).not.toThrow();
+		expect(session.getSessionFile()).toBe(prepared.sessionFile);
+	});
+
+	it("retains staged cleanup authority after a deletion failure", async () => {
+		const storage = new FailingPreparedCleanupStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const prepared = await session.prepareNewSession();
+		await session.ensurePreparedNewSessionOnDisk(prepared);
+		storage.failDelete = true;
+
+		await expect(session.discardPreparedNewSession(prepared)).rejects.toThrow("staged cleanup failed");
+		storage.failDelete = false;
+		await expect(session.discardPreparedNewSession(prepared)).resolves.toBeUndefined();
+	});
+
+	it("cleans up a partially persisted branch when branch preparation fails", async () => {
+		const storage = new FailingBranchPersistenceStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const leafId = session.appendMessage({ role: "user", content: "branch source", timestamp: 1 });
+		session.appendMessage(assistantMessage());
+		const existingFiles = storage.listFilesSync("/sessions", "*");
+		storage.failBranchWrite = true;
+
+		await expect(session.prepareBranchedSession(leafId)).rejects.toThrow("branch persistence failed");
+		expect(storage.listFilesSync("/sessions", "*")).toEqual(existingFiles);
+	});
+
+	it("preserves branch persistence and cleanup errors together", async () => {
+		const storage = new FailingBranchPersistenceStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const leafId = session.appendMessage({ role: "user", content: "branch source", timestamp: 1 });
+		session.appendMessage(assistantMessage());
+		storage.failBranchWrite = true;
+		storage.failDelete = true;
+
+		try {
+			await session.prepareBranchedSession(leafId);
+			expect.unreachable("Expected branch preparation to fail");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors.map(item => String(item))).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("branch persistence failed"),
+					expect.stringContaining("branch cleanup failed"),
+				]),
+			);
+		}
+	});
+
 	it("keeps resident entries bounded after fresh large appends while readers materialize full content and JSONL stays capped text", async () => {
 		isolateBlobDir();
 		const storage = new MemorySessionStorage();

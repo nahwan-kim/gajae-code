@@ -805,10 +805,19 @@ describe("AgentSession handoff", () => {
 			throw new Error("post-commit boom");
 		});
 
-		const result = await session.handoff();
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
 
-		// Post-commit failure is retained, not rolled back: the handoff succeeded.
-		expect(result?.document).toBe(handoffText);
+		// Post-commit failure is surfaced explicitly while retaining the successor.
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("handoff_committed_degraded");
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		expect((caught as Error).cause).toBeInstanceOf(Error);
+		expect(((caught as Error).cause as Error).message).toContain("post-commit boom");
 		expect(session.sessionId).not.toBe(beforeId);
 		expect(
 			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),

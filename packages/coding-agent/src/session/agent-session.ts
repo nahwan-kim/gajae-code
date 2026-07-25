@@ -1044,6 +1044,22 @@ function createHandoffContext(document: string): string {
 	return `<handoff-context>\n${document}\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.`;
 }
 
+async function discardPreparedNewSessionAfterFailure(
+	sessionManager: SessionManager,
+	prepared: PreparedNewSession,
+	transitionError: unknown,
+): Promise<unknown> {
+	try {
+		await sessionManager.discardPreparedNewSession(prepared);
+	} catch (cleanupError) {
+		throw new AggregateError(
+			[transitionError, cleanupError],
+			"Session transition and staged successor cleanup both failed.",
+		);
+	}
+	return transitionError;
+}
+
 // ============================================================================
 // ACP Permission Gate
 // ============================================================================
@@ -9041,8 +9057,7 @@ export class AgentSession {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
-				await this.sessionManager.discardPreparedNewSession(prepared);
-				throw error;
+				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
 			await this.abort();
@@ -9122,8 +9137,7 @@ export class AgentSession {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
-				await this.sessionManager.discardPreparedNewSession(prepared);
-				throw error;
+				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
@@ -9277,8 +9291,7 @@ export class AgentSession {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
-				await this.sessionManager.discardPreparedNewSession(prepared);
-				throw error;
+				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -10758,12 +10771,12 @@ export class AgentSession {
 				return { document: handoffText, savedPath };
 			} catch (switchError) {
 				if (committed) {
-					// The switch already committed; a post-commit step failed. Do not
-					// tear down the new session — surface success (the handoff exists).
-					logger.warn("Handoff post-commit step failed after the session switch committed", {
-						error: switchError instanceof Error ? switchError.message : String(switchError),
+					throw Object.assign(new Error("Handoff committed but successor initialization was degraded."), {
+						code: "handoff_committed_degraded",
+						cause: switchError,
+						handoffDocument: handoffText,
+						savedPath,
 					});
-					return { document: handoffText, savedPath };
 				}
 				// Reversible window: roll back to the pre-handoff session so the
 				// failure is non-destructive. Predecessor gate emitter, provider
@@ -10783,22 +10796,16 @@ export class AgentSession {
 				this.#todoReminderCount = rollbackTodoReminderCount;
 				this.#syncTodoPhasesFromBranch();
 				// Exact-discard only the staged successor; predecessor state was never adopted.
-				if (prepared) {
-					try {
-						await this.sessionManager.discardPreparedNewSession(prepared);
-					} catch (cleanupError) {
-						logger.warn("Failed to remove staged handoff successor after rollback", {
-							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-						});
-					}
-				}
+				const rollbackError = prepared
+					? await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, switchError)
+					: switchError;
 				// Map to cancellation only for a genuine handoff-signal abort; a
 				// downstream error keeps its cause and the generated document.
 				if (handoffSignal.aborted) {
 					throw new Error("Handoff cancelled");
 				}
 				// Preserve the generated handoff document for copy/retry.
-				throw Object.assign(switchError instanceof Error ? switchError : new Error(String(switchError)), {
+				throw Object.assign(rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)), {
 					handoffDocument: handoffText,
 				});
 			}
@@ -10806,7 +10813,7 @@ export class AgentSession {
 			// Genuine handoff-signal cancellation maps to a cancellation error.
 			// Errors surfaced by the inner transaction (which already rolled back
 			// and, for non-aborts, attached the generated document) pass through.
-			if (handoffSignal.aborted) {
+			if (handoffSignal.aborted && !(error instanceof AggregateError)) {
 				throw new Error("Handoff cancelled");
 			}
 			throw error;
@@ -14803,8 +14810,7 @@ export class AgentSession {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
-				await this.sessionManager.discardPreparedNewSession(prepared);
-				throw error;
+				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
